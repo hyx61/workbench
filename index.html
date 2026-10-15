@@ -600,6 +600,7 @@ var GH_TOKEN=localStorage.getItem('wb_gh_token')||'';
 var GIST_ID =localStorage.getItem('wb_gist_id')||'';
 var CLOUD_OK=!!GH_TOKEN;                // 填了令牌才启用云端同步
 var pushing=false, pendingPush=false, pushTimer=null, saveTimer=null;
+var syncing=false, syncPendingPush=false;  // syncNow 执行中：抑制重复延时推送；期间有新改动则结束后补推
 var gistDupCount=0;   // 检测到的重复同步 Gist 数量
 
 function setSyncLabel(txt){try{var el=$('#saveState');if(el)el.textContent=txt;}catch(e){}}
@@ -707,20 +708,61 @@ function gistPull(){
 }
 function schedulePush(){
   if(!ghEnabled())return;
+  if(syncing){ syncPendingPush=true; clearTimeout(pushTimer); pushTimer=null; return; } // 同步中：挂起，同步结束后补推
   clearTimeout(pushTimer);
   pushTimer=setTimeout(function(){ gistPush(); },600);
 }
-function doPull(){
+/* 合并两份数据：按 id 取并集——任一侧独有的记录都会保留，绝不因同步丢数据；
+   同一 id 两边都有时，取"最后改动的那台设备"的版本（按各自 savedAt 判断） */
+function mergeEvents(a,b){
+  var seen={},out=[];
+  (a||[]).concat(b||[]).forEach(function(e){
+    if(!e)return;
+    var k=e.type+'|'+e.ref+'|'+e.at;
+    if(!seen[k]){seen[k]=1;out.push(e);}
+  });
+  out.sort(function(x,y){return (x.at||0)-(y.at||0);});
+  if(out.length>600)out=out.slice(-600);
+  return out;
+}
+function mergeStates(local, remote){
+  var preferLocal=(local.savedAt||0)>=(remote.savedAt||0);
+  function mergeArr(key){
+    var A={},B={},ids={},out=[];
+    (local[key]||[]).forEach(function(x){if(x&&x.id!=null)A[x.id]=x;});
+    (remote[key]||[]).forEach(function(x){if(x&&x.id!=null)B[x.id]=x;});
+    for(var k in A)ids[k]=1; for(var k2 in B)ids[k2]=1;
+    Object.keys(ids).forEach(function(id){
+      out.push(A[id]&&B[id]?(preferLocal?A[id]:B[id]):(A[id]||B[id]));
+    });
+    return out;
+  }
+  var lm=(local.meta&&local.meta.lastRollover)||'', rm=(remote.meta&&remote.meta.lastRollover)||'';
+  var meta={};for(var p in remote.meta)meta[p]=remote.meta[p];for(var q in local.meta)meta[q]=local.meta[q];
+  meta.lastRollover=lm>=rm?lm:rm;
+  return normalizeState({
+    version:1,
+    todos:mergeArr('todos'),notes:mergeArr('notes'),projects:mergeArr('projects'),
+    events:mergeEvents(local.events,remote.events),
+    meta:meta,draft:(local.draft||{}),
+    savedAt:Date.now()
+  });
+}
+/* 完整同步：对账 → 拉取 → 合并 → 推送。合并而非覆盖，本地未同步的新建内容不会丢 */
+function syncNow(){
   if(!ghEnabled())return Promise.resolve();
-  return gistPull().then(function(res){
-    if(!res)return;
-    var rts=res.savedAt||0, lts=state.savedAt||0;
-    if(rts>lts){
-      state=res.state; rollover(); persistLocal(false);
-      renderAll();
-      var d=new Date(); setSyncLabel('· 已同步 '+pad(d.getHours())+':'+pad(d.getMinutes()));
-      toast('已从 GitHub 更新到最新数据');
-    }
+  syncing=true;
+  setSyncLabel('· 同步中…');
+  return reconcileGist().then(function(){ return gistPull(); }).then(function(res){
+    if(res&&res.state){ state=mergeStates(state,res.state); rollover(); persistLocal(false); renderAll(); }
+    return gistPush();
+  }).then(function(){
+    localStorage.setItem('wb_last_sync',String(Date.now()));
+    var d=new Date(); setSyncLabel('· 已同步 '+pad(d.getHours())+':'+pad(d.getMinutes()));
+  }).catch(function(e){ console.error('[sync] failed',e); setSyncLabel('· 同步失败，已保留本地'); })
+  .then(function(){
+    syncing=false; clearTimeout(pushTimer); pushTimer=null;
+    if(syncPendingPush){ syncPendingPush=false; gistPush(); }   // 同步期间用户又改了数据，补推一次
   });
 }
 /* 对账：忽略缓存重新认领；发现多个同步 Gist 时自动切换到数据最新的那个 */
@@ -1237,8 +1279,8 @@ function openSyncSettings(){
         var t=$('#ghTokenInput').value.trim();
         if(!t){toast('请填写令牌');return;}
         GH_TOKEN=t;localStorage.setItem('wb_gh_token',t);CLOUD_OK=true;
-        closeModal();setSyncLabel('· 同步中…');
-        reconcileGist().then(function(){ return doPull(); }).then(function(){ return gistPush(); }).then(function(){ localStorage.setItem('wb_last_sync',String(Date.now())); });
+        closeModal();
+        syncNow();
       }},
     {text:'关闭',fn:closeModal}
   ]);
@@ -1552,7 +1594,7 @@ function applyDrafts(){
 }
 function init(){
   if(!speechSupported())document.body.classList.add('no-voice');
-  if(ghEnabled()){ doPull().then(function(){ return reconcileGist(); }); }
+  if(ghEnabled()){ syncNow(); }
   rollover();
   buildNavs();
   bindForms();
