@@ -350,6 +350,7 @@ textarea{resize:vertical}
         <div class="hero-btns">
           <button type="button" class="btn ghost" data-refresh title="重新加载页面并拉取云端最新数据">刷新同步</button>
           <button type="button" class="btn ghost" data-export>导出备份</button>
+          <button type="button" class="btn ghost" data-csv title="只导出有延续的待办：逾期未完成 + 顺延过来的任务">导出 CSV</button>
           <button type="button" class="btn ghost" data-import>导入</button>
           <button type="button" class="btn ghost" data-sync>同步设置</button>
         </div>
@@ -1512,6 +1513,54 @@ function doExport(){
   state.meta.nudgeDismissedAt=totalRecords();save(false);renderNudge();
   toast('备份文件已生成，请保存到安全位置（换设备时用「导入」恢复）');
 }
+/* ================= 导出 CSV：只导「有延续」的待办 ================= */
+/* 口径（用户明确要求）：延续的待办 = 逾期未完成（due < 今天）+ 今天到期且已顺延过（carried > 0）。
+   灵感速记、项目跟进、统计、全景，以及未延续 / 已完成的待办，一律不导出。 */
+function carriedTodos(){
+  var t=todayStr();
+  return {
+    over:state.todos.filter(function(x){return !x.done&&x.due&&x.due<t;}),
+    carried:state.todos.filter(function(x){return !x.done&&x.due===t&&(x.carried||0)>0;})
+  };
+}
+function dayDiff(a,b){return Math.round((parseDay(b)-parseDay(a))/86400000);}
+function fmtClock(iso){
+  if(!iso)return '';
+  var d=new Date(iso);
+  if(isNaN(d.getTime()))return '';
+  return fmtDate(d)+' '+pad(d.getHours())+':'+pad(d.getMinutes());
+}
+function csvCell(v){
+  var s=String(v==null?'':v);
+  return /[",\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
+}
+function csvRow(cells){return cells.map(csvCell).join(',');}
+function doExportCsv(){
+  var g=carriedTodos();
+  /* 排序与列表一致：先逾期（截止日期升序），后顺延（次数降序），再按优先级 / 创建时间 */
+  g.over.sort(function(a,b){var d=a.due<b.due?-1:(a.due>b.due?1:0);return d||todoCmp(a,b);});
+  g.carried.sort(function(a,b){var d=(b.carried||0)-(a.carried||0);return d||todoCmp(a,b);});
+  var rows=g.over.concat(g.carried);
+  if(!rows.length){toast('当前没有延续的待办任务（无逾期、无顺延），无需导出');return;}
+  var t=todayStr();
+  var lines=[csvRow(['标题','领域','优先级','截止日期','延续状态','顺延次数','关联项目','创建时间'])];
+  rows.forEach(function(x){
+    var over=!!(x.due&&x.due<t);
+    var st=over?('已逾期 '+dayDiff(x.due,t)+' 天'):('今天到期，已顺延 '+(x.carried||0)+' 次');
+    var p=x.projectId?findProj(x.projectId):null;
+    lines.push(csvRow([x.title,x.domain==='life'?'生活':'工作',(PRI[x.priority]||PRI.p3).label,
+      x.due||'',st,x.carried||0,p?p.name:'',fmtClock(x.createdAt)]));
+  });
+  /* BOM 头：Excel 直接打开中文不乱码；CRLF 行尾符合 CSV 规范 */
+  var csv='\ufeff'+lines.join('\r\n');
+  var blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');
+  a.href=url;a.download='延续待办-'+t+'.csv';
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){URL.revokeObjectURL(url);},4000);
+  toast('已导出 '+rows.length+' 条延续待办（逾期 '+g.over.length+' 条 + 顺延 '+g.carried.length+' 条）');
+}
 function normalizeBackup(o){
   var res={todos:[],notes:[],projects:[],skip:0};
   function okId(v){return v==null?'':String(v);}
@@ -1651,6 +1700,7 @@ function bindEvents(){
     if((el=closestAttr(e,'data-pano-day'))){renderPanoDay(el.getAttribute('data-pano-day'));return;}
     if((el=closestAttr(e,'data-pano-future'))){renderPanoDay(el.getAttribute('data-pano-future'));return;}
     if((el=closestAttr(e,'data-export'))){doExport();return;}
+    if((el=closestAttr(e,'data-csv'))){doExportCsv();return;}
     if((el=closestAttr(e,'data-import'))){$('#importFile').click();return;}
     if((el=closestAttr(e,'data-refresh'))){doRefresh();return;}
     if((el=closestAttr(e,'data-sync'))){openSyncSettings();return;}
