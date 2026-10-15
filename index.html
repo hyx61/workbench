@@ -600,6 +600,7 @@ var GH_TOKEN=localStorage.getItem('wb_gh_token')||'';
 var GIST_ID =localStorage.getItem('wb_gist_id')||'';
 var CLOUD_OK=!!GH_TOKEN;                // 填了令牌才启用云端同步
 var pushing=false, pendingPush=false, pushTimer=null, saveTimer=null;
+var gistDupCount=0;   // 检测到的重复同步 Gist 数量
 
 function setSyncLabel(txt){try{var el=$('#saveState');if(el)el.textContent=txt;}catch(e){}}
 function ghEnabled(){ return !!GH_TOKEN; }
@@ -623,28 +624,36 @@ function persistLocal(flash){
     storageOK=false;$('#storageWarn').hidden=false;
   }
 }
-/* 凭令牌自动找到同一个 Gist（跨设备无需手动传 ID） */
-function resolveGistId(){
-  if(GIST_ID)return Promise.resolve(GIST_ID);
-  if(!ghEnabled())return Promise.resolve(null);
+/* 列出令牌名下所有含 workbench.json 的 Gist（跨设备无需手动传 ID） */
+function listWorkbenchGists(){
   return fetch(GIST_API+'?per_page=100',{headers:ghHeaders()}).then(function(r){
     if(!r.ok)throw new Error('HTTP '+r.status);
     return r.json();
   }).then(function(data){
     var list=Array.isArray(data)?data:(data&&data.items)||[];
-    var cands=list.filter(function(g){ return g.files&&g.files['workbench.json']; });
-    if(!cands.length)return null;
-    if(cands.length===1){ GIST_ID=cands[0].id; localStorage.setItem('wb_gist_id',GIST_ID); return GIST_ID; }
-    /* 多个候选：挑内部 savedAt 最新的（即真正有数据的那个），避免误选手机端新建的空 Gist */
-    return Promise.all(cands.map(function(g){
-      return fetch(GIST_API+'/'+g.id,{headers:ghHeaders()}).then(function(r){return r.ok?r.json():null;}).then(function(j){
-        var c=j&&j.files&&j.files['workbench.json']&&j.files['workbench.json'].content, st=0;
-        try{ st=JSON.parse(c).savedAt||0; }catch(e){}
-        return {id:g.id, savedAt:st};
-      }).catch(function(){ return {id:g.id, savedAt:0}; });
-    })).then(function(arr){
+    return list.filter(function(g){ return g.files&&g.files['workbench.json']; });
+  });
+}
+function gistSavedAt(g){
+  return fetch(GIST_API+'/'+g.id,{headers:ghHeaders()}).then(function(r){return r.ok?r.json():null;}).then(function(j){
+    var c=j&&j.files&&j.files['workbench.json']&&j.files['workbench.json'].content, st=0;
+    try{ st=JSON.parse(c).savedAt||0; }catch(e){}
+    return {gist:g, savedAt:st};
+  }).catch(function(){ return {gist:g, savedAt:0}; });
+}
+/* force=true 时忽略本地缓存的 GIST_ID 重新认领，用于发现并收敛重复的 Gist */
+function resolveGistId(force){
+  if(GIST_ID&&!force)return Promise.resolve(GIST_ID);
+  if(!ghEnabled())return Promise.resolve(null);
+  if(force)GIST_ID='';
+  return listWorkbenchGists().then(function(cands){
+    if(!cands.length){ gistDupCount=0; return null; }
+    if(cands.length===1){ gistDupCount=0; GIST_ID=cands[0].id; localStorage.setItem('wb_gist_id',GIST_ID); return GIST_ID; }
+    /* 多个候选：挑内部 savedAt 最新的，收敛到同一个 Gist，避免多设备各建各的 */
+    gistDupCount=cands.length;
+    return Promise.all(cands.map(gistSavedAt)).then(function(arr){
       arr.sort(function(a,b){ return b.savedAt-a.savedAt; });
-      GIST_ID=arr[0].id; localStorage.setItem('wb_gist_id',GIST_ID); return GIST_ID;
+      GIST_ID=arr[0].gist.id; localStorage.setItem('wb_gist_id',GIST_ID); return GIST_ID;
     });
   }).catch(function(e){ console.error('[gist] resolve failed',e); return null; });
 }
@@ -713,6 +722,28 @@ function doPull(){
       toast('已从 GitHub 更新到最新数据');
     }
   });
+}
+/* 对账：忽略缓存重新认领；发现多个同步 Gist 时自动切换到数据最新的那个 */
+function reconcileGist(){
+  if(!ghEnabled())return Promise.resolve();
+  return resolveGistId(true).then(function(){
+    if(gistDupCount>1)toast('检测到 '+gistDupCount+' 个同步 Gist，已切换到数据最新的一个；多余的请在「同步设置 → 整理 Gist」清理');
+  });
+}
+/* 清理：删除除当前 GIST_ID 之外所有含 workbench.json 的 Gist */
+function cleanupDuplicateGists(){
+  if(!ghEnabled())return Promise.resolve(0);
+  return listWorkbenchGists().then(function(cands){
+    var others=cands.filter(function(g){ return g.id!==GIST_ID; });
+    if(!others.length){ toast('没有发现多余的 Gist'); return 0; }
+    return Promise.all(others.map(function(g){
+      return fetch(GIST_API+'/'+g.id,{method:'DELETE',headers:ghHeaders()}).then(function(r){return r.ok;}).catch(function(){return false;});
+    })).then(function(res){
+      var ok=res.filter(Boolean).length, bad=res.length-ok;
+      toast('已清理 '+ok+' 个多余的 Gist'+(bad?('，'+bad+' 个失败'):''));
+      return ok;
+    });
+  }).catch(function(e){ toast('清理失败：'+e.message); return 0; });
 }
 function save(flash){ persistLocal(flash); schedulePush(); }
 function saveDebounced(){clearTimeout(saveTimer);saveTimer=setTimeout(function(){save();},350);}
@@ -1159,21 +1190,38 @@ function openModal(title,body,buttons){
   $('#modalWrap').hidden=false;
 }
 function closeModal(){$('#modalWrap').hidden=true;$('#modalBody').innerHTML='';}
-function openSyncSettings(){
+function ghStatusText(){
   var lastSync=localStorage.getItem('wb_last_sync');
   var lsText=lastSync?('上次同步：'+new Date(+lastSync).toLocaleString()):'尚未同步';
+  var dup=(gistDupCount>1)?('<br><span style="color:#b45309">检测到 '+gistDupCount+' 个同步 Gist（重复创建造成的），建议点「整理 Gist」</span>'):'';
+  return 'Gist ID：'+(GIST_ID||'（未创建，保存后自动新建）')+'<br>'+lsText+dup;
+}
+function refreshGhStatus(){var s=$('#ghStatus');if(s)s.innerHTML=ghStatusText();}
+function openSyncSettings(){
   var body=''
     +'<p style="margin:0 0 10px;color:#475569;font-size:13px">同步数据将保存在<b>你自己的 GitHub Gist</b>（私有仓库，不占用资料库容量）。需要一个拥有 <code>gist</code> 权限的 GitHub 个人访问令牌（PAT）。</p>'
     +'<label style="display:block;font-size:13px;margin-bottom:4px">GitHub 令牌（PAT）</label>'
     +'<input id="ghTokenInput" type="password" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:8px;box-sizing:border-box" placeholder="ghp_... 或 github_pat_..." value="'+esc(GH_TOKEN)+'">'
     +'<p style="margin:8px 0 0;font-size:12px;color:#64748b">在 GitHub → Settings → Developer settings → Personal access tokens 生成，勾选 <b>gist</b> 权限即可。令牌只保存在本机浏览器，不会上传给任何人。</p>'
-    +'<div style="margin-top:10px;font-size:12px;color:#64748b" id="ghStatus">Gist ID：'+(GIST_ID||'（未创建，保存后自动新建）')+'<br>'+lsText+'</div>';
+    +'<div style="margin-top:10px;font-size:12px;color:#64748b" id="ghStatus">'+ghStatusText()+'</div>';
   openModal('同步设置（GitHub Gist）', body, [
     {text:'断开同步',cls:'danger',fn:function(){
         if(!GH_TOKEN){toast('当前未启用同步');return;}
         confirmModal('断开后本机将不再与 GitHub 同步，数据仅留在各设备本地。确定断开？','断开',function(){
           localStorage.removeItem('wb_gh_token');localStorage.removeItem('wb_gist_id');
-          GH_TOKEN='';GIST_ID='';CLOUD_OK=false;closeModal();toast('已断开同步');setSyncLabel('');
+          GH_TOKEN='';GIST_ID='';CLOUD_OK=false;gistDupCount=0;closeModal();toast('已断开同步');setSyncLabel('');
+        });
+      }},
+    {text:'整理 Gist',cls:'ghost',fn:function(){
+        if(!GH_TOKEN){toast('请先保存令牌后再整理');return;}
+        setSyncLabel('· 检查中…');
+        resolveGistId(true).then(function(){
+          setSyncLabel('');refreshGhStatus();
+          if(gistDupCount<=1){toast('只检测到 1 个同步 Gist，无需整理');return;}
+          confirmModal('检测到 <b>'+gistDupCount+'</b> 个同步 Gist（多设备各自新建造成的）。将保留数据最新的 1 个，删除其余 '+(gistDupCount-1)+' 个。<b>删除不可恢复，请先确认各设备数据已备份或已合并。</b>','删除多余的',function(){
+            setSyncLabel('· 清理中…');
+            cleanupDuplicateGists().then(function(){ resolveGistId(true).then(function(){ setSyncLabel(''); refreshGhStatus(); }); });
+          });
         });
       }},
     {text:'测试连接',cls:'ghost',fn:function(){
@@ -1181,7 +1229,7 @@ function openSyncSettings(){
         if(!t){toast('请先填写令牌');return;}
         setSyncLabel('· 连接测试中…');
         fetch(GIST_API,{headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+t}}).then(function(r){
-          if(r.ok){toast('连接成功（令牌有效）');var s=$('#ghStatus');if(s)s.textContent='连接正常：令牌有效';}
+          if(r.ok){toast('连接成功（令牌有效）');refreshGhStatus();}
           else{toast('连接失败：HTTP '+r.status);}
         }).catch(function(e){toast('连接失败：'+e.message);});
       }},
@@ -1190,7 +1238,7 @@ function openSyncSettings(){
         if(!t){toast('请填写令牌');return;}
         GH_TOKEN=t;localStorage.setItem('wb_gh_token',t);CLOUD_OK=true;
         closeModal();setSyncLabel('· 同步中…');
-        doPull().then(function(){ return gistPush(); }).then(function(){ localStorage.setItem('wb_last_sync',String(Date.now())); });
+        reconcileGist().then(function(){ return doPull(); }).then(function(){ return gistPush(); }).then(function(){ localStorage.setItem('wb_last_sync',String(Date.now())); });
       }},
     {text:'关闭',fn:closeModal}
   ]);
@@ -1504,7 +1552,7 @@ function applyDrafts(){
 }
 function init(){
   if(!speechSupported())document.body.classList.add('no-voice');
-  if(ghEnabled()){ doPull(); }
+  if(ghEnabled()){ doPull().then(function(){ return reconcileGist(); }); }
   rollover();
   buildNavs();
   bindForms();
